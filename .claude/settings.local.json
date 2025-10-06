@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew:*)",
+      "Bash(echo:*)",
+      "Bash(where cmake)",
+      "Bash(ls:*)",
+      "Bash(export ANDROID_HOME=\"$LOCALAPPDATA/Android/Sdk\")",
+      "Bash(export ANDROID_SDK_ROOT=\"$LOCALAPPDATA/Android/Sdk\")",
+      "Bash(wsl:*)",
+      "Bash(find:*)",
+      "Bash(where ninja)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

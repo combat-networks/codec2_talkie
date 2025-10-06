@@ -23,33 +23,41 @@ android {
         minSdkVersion 23
         targetSdkVersion 35
         testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
-        externalNativeBuild {
-            cmake {
-            }
-        }
         ndk {
             abiFilters = []
             abiFilters.addAll(rootProject.ext.ABI_FILTERS.split(';').collect{it as String})
         }
     }
+
+    sourceSets {
+        main {
+            // 将预编译的库添加到jniLibs
+            jniLibs.srcDirs = ["build/imported-lib"]
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
+
+    // 禁用外部原生构建，我们将使用自定义任务
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
         }
     }
 }
 
-tasks.configureEach { task ->
-    if (task.name.contains('externalNativeBuildRelease') || task.name.contains("externalNativeBuildDebug")) {
-        task.dependsOn compileCodec2
-    } else if (task.name.contains('buildCMakeDebug') || task.name.contains("buildCMakeRelease") || task.name.contains("buildCMakeRelWithDebInfo")) {
-        task.dependsOn compileCodec2
+// 禁用自动的CMake构建任务
+tasks.whenTaskAdded { task ->
+    if (task.name.contains('externalNativeBuild') ||
+            task.name.contains('configureCMake') ||
+            task.name.contains('buildCMake')) {
+        task.enabled = false
     }
 }
 
@@ -64,38 +72,296 @@ tasks.register('compileCodec2') {
     }
 
     doLast {
-        exec {
-            workingDir "$projectDir/build/codec2_build_linux"
-            commandLine "cmake", "$projectDir/src/codec2"
-        }
+        // 首先编译Windows主机工具generate_codebook
+        def isWindows = System.getProperty('os.name').toLowerCase().contains('windows')
+        def generateCodebookExe = ""
 
-        exec {
-            workingDir "$projectDir/build/codec2_build_linux"
-            commandLine "make"
+        if (isWindows) {
+            println("Compiling generate_codebook.exe for Windows host...")
+            def hostBuildDir = "$projectDir/build/host_tools"
+            new File(hostBuildDir).mkdirs()
+
+            // 使用cl.exe (MSVC)编译generate_codebook
+            def generateCodebookSrc = "$projectDir/src/codec2/src/generate_codebook.c"
+            generateCodebookExe = hostBuildDir + "/generate_codebook.exe"
+
+            try {
+                exec {
+                    workingDir hostBuildDir
+                    // 设置MSVC环境并编译
+                    commandLine 'cmd', '/c',
+                        '""C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat" && ' +
+                        'cl.exe /Fe:generate_codebook.exe "' + generateCodebookSrc + '""'
+                    ignoreExitValue = false
+                }
+                println("Successfully compiled generate_codebook.exe")
+            } catch (Exception e) {
+                println("Failed to compile with MSVC, trying with clang...")
+                // 尝试使用clang编译
+                def clangPath = android.ndkDirectory.toString() + "/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe"
+                exec {
+                    workingDir hostBuildDir
+                    commandLine clangPath, "-o", "generate_codebook.exe", generateCodebookSrc
+                    ignoreExitValue = false
+                }
+                println("Successfully compiled generate_codebook.exe with clang")
+            }
         }
 
         for (String abi : rootProject.ext.ABI_FILTERS.split(";")) {
             System.out.println("Handle abi " + abi)
-            exec {
-                workingDir "$projectDir/build/codec2_build_android_" + abi
-                commandLine "cmake", "$projectDir/src/codec2",
-                        "-DCMAKE_TOOLCHAIN_FILE=" + android.ndkDirectory + "/build/cmake/android.toolchain.cmake",
-                        "-DUNITTEST=FALSE",
-                        "-DGENERATE_CODEBOOK=$projectDir/build/codec2_build_linux/src/generate_codebook",
-                        "-DANDROID_NATIVE_API_LEVEL=23", "-DANDROID_ABI=" + abi,
-                        "-DANDROID_STL=c++_shared"
+            System.out.println("NDK Directory: " + android.ndkDirectory)
+
+            def buildDir = "$projectDir/build/codec2_build_android_" + abi
+
+            // 清除CMake缓存文件
+            def cmakeCache = new File(buildDir + "/CMakeCache.txt")
+            def cmakeFilesDir = new File(buildDir + "/CMakeFiles")
+
+            // 清理codec2_native构建目录的CMake缓存
+            def codec2NativeDir = buildDir + "/src/codec2_native"
+            def codec2NativeCmakeCache = new File(codec2NativeDir + "/CMakeCache.txt")
+            def codec2NativeCmakeFilesDir = new File(codec2NativeDir + "/CMakeFiles")
+
+            if (cmakeCache.exists()) {
+                cmakeCache.delete()
+                println("Deleted CMakeCache.txt")
             }
 
-            exec {
-                workingDir "$projectDir/build/codec2_build_android_" + abi
-                commandLine "cmake", "--build", "."
+            if (cmakeFilesDir.exists()) {
+                cmakeFilesDir.deleteDir()
+                println("Deleted CMakeFiles directory")
             }
 
+            if (codec2NativeCmakeCache.exists()) {
+                codec2NativeCmakeCache.delete()
+                println("Deleted codec2_native CMakeCache.txt")
+            }
+
+            if (codec2NativeCmakeFilesDir.exists()) {
+                codec2NativeCmakeFilesDir.deleteDir()
+                println("Deleted codec2_native CMakeFiles directory")
+            }
+
+
+            def ndkPath = android.ndkDirectory.toString()
+            def cmakeToolchainFile = ndkPath + "/build/cmake/android.toolchain.cmake"
+            def clangPath = ndkPath + "/toolchains/llvm/prebuilt/windows-x86_64/bin"
+
+            // 使用系统中安装的ninja.exe路径
+            def ninjaPath = "C:\\Users\\sae\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Ninja-build.Ninja_Microsoft.Winget.Source_8wekyb3d8bbwe\\ninja.exe"
+
+            // 检查文件是否存在
+            println("Checking if files exist:")
+            println("  CMake toolchain file: " + new File(cmakeToolchainFile).exists())
+            println("  Ninja executable: " + new File(ninjaPath).exists())
+            println("  Clang C compiler: " + new File(clangPath + "/clang.exe").exists())
+            println("  Clang C++ compiler: " + new File(clangPath + "/clang++.exe").exists())
+
+            def cmakeArgs = [
+                    "cmake", "$projectDir/src/codec2",
+                    "-DCMAKE_TOOLCHAIN_FILE=" + cmakeToolchainFile,
+                    "-DUNITTEST=FALSE",
+                    "-DBUILD_SHARED_LIBS=ON",
+                    "-DANDROID_NATIVE_API_LEVEL=23",
+                    "-DANDROID_ABI=" + abi,
+                    "-DANDROID_STL=c++_shared",
+                    "-DCMAKE_VERBOSE_MAKEFILE=ON",
+                    "-G", "Ninja",
+                    "-DCMAKE_MAKE_PROGRAM=" + ninjaPath,
+                    "-DCMAKE_C_COMPILER=" + clangPath + "/clang.exe",
+                    "-DCMAKE_CXX_COMPILER=" + clangPath + "/clang++.exe",
+                    "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + buildDir + "/lib",
+                    "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=" + buildDir + "/bin",
+                    "-DCMAKE_INSTALL_PREFIX=" + buildDir + "/install"
+            ]
+
+            // 在Windows上，传递预编译的generate_codebook路径
+            if (isWindows && generateCodebookExe) {
+                cmakeArgs.add("-DGENERATE_CODEBOOK=" + generateCodebookExe)
+            }
+
+            println("Running CMake with args: " + cmakeArgs)
+
+            try {
+                exec {
+                    workingDir buildDir
+                    commandLine cmakeArgs
+                    // 添加环境变量以帮助调试
+                    environment "ANDROID_NDK_HOME", android.ndkDirectory
+                    environment "NDK_ROOT", android.ndkDirectory
+                    // 捕获输出以便调试
+                    standardOutput = new ByteArrayOutputStream()
+                    errorOutput = new ByteArrayOutputStream()
+                    ignoreExitValue = true
+                }
+                println("CMake configuration completed")
+            } catch (Exception e) {
+                println("CMake configuration failed: " + e.message)
+                throw e
+            }
+
+            println("Running CMake build")
+            try {
+                def buildOutput = new ByteArrayOutputStream()
+                def buildError = new ByteArrayOutputStream()
+                def result = exec {
+                    workingDir buildDir
+                    commandLine "cmake", "--build", "."
+                    // 捕获输出以便调试
+                    standardOutput = buildOutput
+                    errorOutput = buildError
+                    ignoreExitValue = true  // 改为 true，以便我们可以捕获错误信息
+                }
+
+                // 检查构建是否成功
+                if (result.exitValue != 0) {
+                    println("CMake build failed with exit code: " + result.exitValue)
+                    println("Build output: " + buildOutput.toString())
+                    println("Build error: " + buildError.toString())
+                    throw new GradleException("CMake build failed with exit code: " + result.exitValue)
+                }
+
+                println("CMake build completed")
+                println("Build output: " + buildOutput.toString())
+                if (buildError.toString()) {
+                    println("Build error: " + buildError.toString())
+                }
+            } catch (Exception e) {
+                println("CMake build failed: " + e.message)
+                throw e
+            }
+
+            // 运行CMake install命令
+            println("Running CMake install")
+            try {
+                def installOutput = new ByteArrayOutputStream()
+                def installError = new ByteArrayOutputStream()
+                def result = exec {
+                    workingDir buildDir
+                    commandLine "cmake", "--install", "."
+                    // 捕获输出以便调试
+                    standardOutput = installOutput
+                    errorOutput = installError
+                    ignoreExitValue = false  // 改为 false，这样安装失败时会抛出异常
+                }
+                println("CMake install completed")
+                println("Install output: " + installOutput.toString())
+                if (installError.toString()) {
+                    println("Install error: " + installError.toString())
+                }
+            } catch (Exception e) {
+                println("CMake install failed: " + e.message)
+                throw e
+            }
+
+            // 检查源文件是否存在
+            def sourceLib = buildDir + "/install/lib/libcodec2.so"
+            println("Checking if source library exists: " + new File(sourceLib).exists())
+            if (!new File(sourceLib).exists()) {
+                // 列出 install 目录的内容
+                def installDir = new File(buildDir + "/install")
+                if (installDir.exists()) {
+                    println("Contents of install directory:")
+                    installDir.eachFileRecurse { file ->
+                        println("  " + file.path)
+                    }
+                } else {
+                    println("Install directory does not exist: " + installDir.path)
+                }
+            }
+
+            // 确保目标目录存在
+            def targetDir = "$projectDir/build/imported-lib/" + abi
+            new File(targetDir).mkdirs()
+
+            // 复制库文件到jniLibs目录
+            def targetLib = targetDir + "/libcodec2.so"
+
+            println("Copying $sourceLib to $targetLib")
+            if (new File(sourceLib).exists()) {
+                copy {
+                    from sourceLib
+                    into targetDir
+                }
+            } else {
+                println("Source library does not exist, skipping copy")
+            }
+
+            // 验证文件是否存在
+            println("Checking if copied file exists: " + new File(targetLib).exists())
+
+            // 现在编译JNI包装器
+            def jniBuildDir = "$projectDir/build/jni_build_" + abi
+            new File(jniBuildDir).mkdirs()
+
+            def jniCmakeArgs = [
+                    "cmake", "$projectDir/src/main/cpp",
+                    "-DCMAKE_TOOLCHAIN_FILE=" + cmakeToolchainFile,
+                    "-DANDROID_NATIVE_API_LEVEL=23",
+                    "-DANDROID_ABI=" + abi,
+                    "-DANDROID_STL=c++_shared",
+                    "-DCMAKE_VERBOSE_MAKEFILE=ON",
+                    "-G", "Ninja",
+                    "-DCMAKE_MAKE_PROGRAM=" + ninjaPath,
+                    "-DCMAKE_C_COMPILER=" + clangPath + "/clang.exe",
+                    "-DCMAKE_CXX_COMPILER=" + clangPath + "/clang++.exe",
+                    "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + jniBuildDir + "/lib",
+                    "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=" + jniBuildDir + "/bin",
+                    "-DLIBCODEC2_PATH=" + targetDir
+            ]
+
+            println("Running JNI CMake with args: " + jniCmakeArgs)
+
+            try {
+                exec {
+                    workingDir jniBuildDir
+                    commandLine jniCmakeArgs
+                    environment "ANDROID_NDK_HOME", android.ndkDirectory
+                    environment "NDK_ROOT", android.ndkDirectory
+                    standardOutput = new ByteArrayOutputStream()
+                    errorOutput = new ByteArrayOutputStream()
+                    ignoreExitValue = true
+                }
+                println("JNI CMake configuration completed")
+            } catch (Exception e) {
+                println("JNI CMake configuration failed: " + e.message)
+                throw e
+            }
+
+            try {
+                exec {
+                    workingDir jniBuildDir
+                    commandLine "cmake", "--build", "."
+                    standardOutput = new ByteArrayOutputStream()
+                    errorOutput = new ByteArrayOutputStream()
+                    ignoreExitValue = true
+                }
+                println("JNI CMake build completed")
+            } catch (Exception e) {
+                println("JNI CMake build failed: " + e.message)
+                throw e
+            }
+
+            // 复制JNI库到jniLibs目录
+            def jniSourceLib = jniBuildDir + "/lib/libCodec2JNI.so"
+            def jniTargetLib = targetDir + "/libCodec2JNI.so"
+
+            println("Copying JNI library $jniSourceLib to $jniTargetLib")
             copy {
-                from "$projectDir/build/codec2_build_android_" + abi + "/src/libcodec2.so"
-                into "$projectDir/build/imported-lib/" + abi
+                from jniSourceLib
+                into targetDir
             }
+
+            println("Checking if JNI library exists: " + new File(jniTargetLib).exists())
         }
+    }
+}
+
+// 确保在预构建阶段完成我们的自定义编译任务
+tasks.whenTaskAdded { task ->
+    if (task.name == 'preDebugBuild' || task.name == 'preReleaseBuild') {
+        task.dependsOn compileCodec2
     }
 }
 

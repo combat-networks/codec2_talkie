@@ -23,33 +23,41 @@ android {
         minSdkVersion 23
         targetSdkVersion 35
         testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
-        externalNativeBuild {
-            cmake {
-            }
-        }
         ndk {
             abiFilters = []
             abiFilters.addAll(rootProject.ext.ABI_FILTERS.split(';').collect{it as String})
         }
     }
+
+    sourceSets {
+        main {
+            // 将预编译的库添加到jniLibs
+            jniLibs.srcDirs = ["build/imported-lib"]
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
+
+    // 禁用外部原生构建，我们将使用自定义任务
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
         }
     }
 }
 
-tasks.configureEach { task ->
-    if (task.name.contains('externalNativeBuildRelease') || task.name.contains("externalNativeBuildDebug")) {
-        task.dependsOn compileOpus
-    } else if (task.name.contains('buildCMakeDebug') || task.name.contains("buildCMakeRelease") || task.name.contains("buildCMakeRelWithDebInfo")) {
-        task.dependsOn compileOpus
+// 禁用自动的CMake构建任务
+tasks.whenTaskAdded { task ->
+    if (task.name.contains('externalNativeBuild') ||
+            task.name.contains('configureCMake') ||
+            task.name.contains('buildCMake')) {
+        task.enabled = false
     }
 }
 
@@ -63,37 +71,217 @@ tasks.register('compileOpus') {
     }
 
     doLast {
-        exec {
-            workingDir "$projectDir/build/opus_build_linux"
-            commandLine "cmake", "$projectDir/src/opus"
-        }
+        // Skip Linux build on Windows and build Android directly
+        def isWindows = System.getProperty('os.name').toLowerCase().contains('windows')
 
-        exec {
-            workingDir "$projectDir/build/opus_build_linux"
-            commandLine "make"
+        if (!isWindows) {
+            // Only build Linux version on Linux/Mac
+            exec {
+                workingDir "$projectDir/build/opus_build_linux"
+                commandLine "cmake", "$projectDir/src/opus"
+            }
+
+            exec {
+                workingDir "$projectDir/build/opus_build_linux"
+                commandLine "make"
+            }
         }
 
         for (String abi : rootProject.ext.ABI_FILTERS.split(";")) {
             System.out.println("Handle abi " + abi)
-            exec {
-                workingDir "$projectDir/build/opus_build_android_" + abi
-                commandLine "cmake", "$projectDir/src/opus",
-                        "-DOPUS_BUILD_SHARED_LIBRARY=true",
-                        "-DCMAKE_TOOLCHAIN_FILE=" + android.ndkDirectory + "/build/cmake/android.toolchain.cmake",
-                        "-DANDROID_NATIVE_API_LEVEL=23", "-DANDROID_ABI=" + abi,
-                        "-DANDROID_STL=c++_shared"
+            System.out.println("NDK Directory: " + android.ndkDirectory)
+
+            def buildDir = "$projectDir/build/opus_build_android_" + abi
+
+            // 清除CMake缓存文件
+            def cmakeCache = new File(buildDir + "/CMakeCache.txt")
+            def cmakeFilesDir = new File(buildDir + "/CMakeFiles")
+
+            if (cmakeCache.exists()) {
+                cmakeCache.delete()
+                println("Deleted CMakeCache.txt")
             }
 
-            exec {
-                workingDir "$projectDir/build/opus_build_android_" + abi
-                commandLine "cmake", "--build", "."
+            if (cmakeFilesDir.exists()) {
+                cmakeFilesDir.deleteDir()
+                println("Deleted CMakeFiles directory")
             }
 
+            def ndkPath = android.ndkDirectory.toString()
+            def cmakeToolchainFile = ndkPath + "/build/cmake/android.toolchain.cmake"
+            def clangPath = ndkPath + "/toolchains/llvm/prebuilt/windows-x86_64/bin"
+
+            // 使用系统中安装的ninja.exe路径
+            def ninjaPath = "C:\\Users\\sae\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Ninja-build.Ninja_Microsoft.Winget.Source_8wekyb3d8bbwe\\ninja.exe"
+
+            // 检查文件是否存在
+            println("Checking if files exist:")
+            println("  CMake toolchain file: " + new File(cmakeToolchainFile).exists())
+            println("  Ninja executable: " + new File(ninjaPath).exists())
+            println("  Clang C compiler: " + new File(clangPath + "/clang.exe").exists())
+            println("  Clang C++ compiler: " + new File(clangPath + "/clang++.exe").exists())
+
+            def cmakeArgs = [
+                    "cmake", "$projectDir/src/opus",
+                    "-DOPUS_BUILD_SHARED_LIBRARY=true",
+                    "-DCMAKE_TOOLCHAIN_FILE=" + cmakeToolchainFile,
+                    "-DANDROID_NATIVE_API_LEVEL=23",
+                    "-DANDROID_ABI=" + abi,
+                    "-DANDROID_STL=c++_shared",
+                    "-DCMAKE_VERBOSE_MAKEFILE=ON",
+                    "-G", "Ninja",
+                    "-DCMAKE_MAKE_PROGRAM=" + ninjaPath,
+                    "-DCMAKE_C_COMPILER=" + clangPath + "/clang.exe",
+                    "-DCMAKE_CXX_COMPILER=" + clangPath + "/clang++.exe",
+                    "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + buildDir + "/lib",
+                    "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=" + buildDir + "/bin",
+                    "-DCMAKE_INSTALL_PREFIX=" + buildDir + "/install"
+            ]
+
+            println("Running CMake with args: " + cmakeArgs)
+
+            try {
+                exec {
+                    workingDir buildDir
+                    commandLine cmakeArgs
+                    environment "ANDROID_NDK_HOME", android.ndkDirectory
+                    environment "NDK_ROOT", android.ndkDirectory
+                    // 捕获输出以便调试
+                    standardOutput = new ByteArrayOutputStream()
+                    errorOutput = new ByteArrayOutputStream()
+                    ignoreExitValue = true
+                }
+                println("CMake configuration completed")
+            } catch (Exception e) {
+                println("CMake configuration failed: " + e.message)
+                throw e
+            }
+
+            println("Running CMake build")
+            try {
+                exec {
+                    workingDir buildDir
+                    commandLine "cmake", "--build", "."
+                    environment "ANDROID_NDK_HOME", android.ndkDirectory
+                    environment "NDK_ROOT", android.ndkDirectory
+                    // 捕获输出以便调试
+                    standardOutput = new ByteArrayOutputStream()
+                    errorOutput = new ByteArrayOutputStream()
+                    ignoreExitValue = true
+                }
+                println("CMake build completed")
+            } catch (Exception e) {
+                println("CMake build failed: " + e.message)
+                throw e
+            }
+
+            // 运行CMake install命令
+            println("Running CMake install")
+            try {
+                exec {
+                    workingDir buildDir
+                    commandLine "cmake", "--install", "."
+                    environment "ANDROID_NDK_HOME", android.ndkDirectory
+                    environment "NDK_ROOT", android.ndkDirectory
+                    // 捕获输出以便调试
+                    standardOutput = new ByteArrayOutputStream()
+                    errorOutput = new ByteArrayOutputStream()
+                    ignoreExitValue = true
+                }
+                println("CMake install completed")
+            } catch (Exception e) {
+                println("CMake install failed: " + e.message)
+                throw e
+            }
+
+            // 确保目标目录存在
+            def targetDir = "$projectDir/build/imported-lib/" + abi
+            new File(targetDir).mkdirs()
+
+            // 复制库文件到jniLibs目录
+            def sourceLib = buildDir + "/install/lib/libopus.so"
+            def targetLib = targetDir + "/libopus.so"
+
+            println("Copying $sourceLib to $targetLib")
             copy {
-                from "$projectDir/build/opus_build_android_" + abi + "/libopus.so"
-                into "$projectDir/build/imported-lib/" + abi
+                from sourceLib
+                into targetDir
             }
+
+            // 验证文件是否存在
+            println("Checking if copied file exists: " + new File(targetLib).exists())
+
+            // 现在编译JNI包装器
+            def jniBuildDir = "$projectDir/build/jni_build_" + abi
+            new File(jniBuildDir).mkdirs()
+
+            def jniCmakeArgs = [
+                    "cmake", "$projectDir/src/main/cpp",
+                    "-DCMAKE_TOOLCHAIN_FILE=" + cmakeToolchainFile,
+                    "-DANDROID_NATIVE_API_LEVEL=23",
+                    "-DANDROID_ABI=" + abi,
+                    "-DANDROID_STL=c++_shared",
+                    "-DCMAKE_VERBOSE_MAKEFILE=ON",
+                    "-G", "Ninja",
+                    "-DCMAKE_MAKE_PROGRAM=" + ninjaPath,
+                    "-DCMAKE_C_COMPILER=" + clangPath + "/clang.exe",
+                    "-DCMAKE_CXX_COMPILER=" + clangPath + "/clang++.exe",
+                    "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + jniBuildDir + "/lib",
+                    "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=" + jniBuildDir + "/bin",
+                    "-DLIBOPUS_PATH=" + targetDir
+            ]
+
+            println("Running JNI CMake with args: " + jniCmakeArgs)
+
+            try {
+                exec {
+                    workingDir jniBuildDir
+                    commandLine jniCmakeArgs
+                    environment "ANDROID_NDK_HOME", android.ndkDirectory
+                    environment "NDK_ROOT", android.ndkDirectory
+                    standardOutput = new ByteArrayOutputStream()
+                    errorOutput = new ByteArrayOutputStream()
+                    ignoreExitValue = true
+                }
+                println("JNI CMake configuration completed")
+            } catch (Exception e) {
+                println("JNI CMake configuration failed: " + e.message)
+                throw e
+            }
+
+            try {
+                exec {
+                    workingDir jniBuildDir
+                    commandLine "cmake", "--build", "."
+                    standardOutput = new ByteArrayOutputStream()
+                    errorOutput = new ByteArrayOutputStream()
+                    ignoreExitValue = true
+                }
+                println("JNI CMake build completed")
+            } catch (Exception e) {
+                println("JNI CMake build failed: " + e.message)
+                throw e
+            }
+
+            // 复制JNI库到jniLibs目录
+            def jniSourceLib = jniBuildDir + "/lib/libOpusJNI.so"
+            def jniTargetLib = targetDir + "/libOpusJNI.so"
+
+            println("Copying JNI library $jniSourceLib to $jniTargetLib")
+            copy {
+                from jniSourceLib
+                into targetDir
+            }
+
+            println("Checking if JNI library exists: " + new File(jniTargetLib).exists())
         }
+    }
+}
+
+// 确保在预构建阶段完成我们的自定义编译任务
+tasks.whenTaskAdded { task ->
+    if (task.name == 'preDebugBuild' || task.name == 'preReleaseBuild') {
+        task.dependsOn compileOpus
     }
 }
 
