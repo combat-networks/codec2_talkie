@@ -35,6 +35,13 @@ android {
             jniLibs.srcDirs = ["build/imported-lib"]
         }
     }
+    
+    // 添加C++标准库到APK
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
 
     buildTypes {
         release {
@@ -288,8 +295,24 @@ tasks.register('compileCodec2') {
                 println("Source library does not exist, skipping copy")
             }
 
+            // 复制C++标准库
+            def cppSharedLib = android.ndkDirectory.toString() + "/sources/cxx-stl/llvm-libc++/libs/" + abi + "/libc++_shared.so"
+            def targetCppLib = targetDir + "/libc++_shared.so"
+            
+            println("Copying C++ shared library from $cppSharedLib to $targetCppLib")
+            if (new File(cppSharedLib).exists()) {
+                copy {
+                    from cppSharedLib
+                    into targetDir
+                }
+                println("C++ shared library copied successfully")
+            } else {
+                println("C++ shared library does not exist at: $cppSharedLib")
+            }
+
             // 验证文件是否存在
             println("Checking if copied file exists: " + new File(targetLib).exists())
+            println("Checking if C++ shared library exists: " + new File(targetCppLib).exists())
 
             // 现在编译JNI包装器
             def jniBuildDir = "$projectDir/build/jni_build_" + abi

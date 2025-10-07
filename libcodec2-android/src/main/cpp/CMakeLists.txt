@@ -40,4 +40,5 @@ target_link_libraries(
         Codec2JNI
         libcodec2
         ${log-lib}
+        c++_shared
         "-Wl,--build-id=none")

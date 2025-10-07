@@ -39,5 +39,6 @@ target_link_libraries(
 		OpusJNI
 		libopus
 		${log-lib}
+		c++_shared
 		"-Wl,--build-id=none")
 
